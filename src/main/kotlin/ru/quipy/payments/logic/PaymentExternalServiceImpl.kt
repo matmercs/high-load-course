@@ -12,6 +12,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -41,6 +42,10 @@ class PaymentExternalSystemAdapterImpl(
         window = Duration.ofSeconds(1),
     )
 
+    // Не более parallelRequests вызовов провайдера одновременно, иначе провайдер отвечает
+    // parallel_requests_limit_breached; fair = true слоты выдаются по очереди, ранние заказы не обгоняются поздними
+    private val parallelLimiter = Semaphore(parallelRequests, true)
+
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -56,6 +61,9 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        // Сначала слот окна (ждать можно долго), потом rate limiter (разрешение — прямо перед отправкой)
+        // acquire() до try: если он не выполнился, finally не должен освобождать чужой слот
+        parallelLimiter.acquire()
         try {
             // Разрешение берём непосредственно перед отправкой, чтобы между ним и приходом запроса к провайдеру не было лишней работы, которая могла бы сдвинуть запросы в одно окно провайдера
             rateLimiter.tickBlocking()
@@ -98,6 +106,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            parallelLimiter.release()
         }
     }
 
