@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -21,6 +22,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -45,6 +47,9 @@ class PaymentExternalSystemAdapterImpl(
     // Не более parallelRequests вызовов провайдера одновременно, иначе провайдер отвечает
     // parallel_requests_limit_breached; fair = true слоты выдаются по очереди, ранние заказы не обгоняются поздними
     private val parallelLimiter = Semaphore(parallelRequests, true)
+
+    // Исходящая нагрузка: сколько вызовов провайдера уходит (за каждый платим price)
+    private val outgoingCounter = meterRegistry.counter("shop.payments.outgoing", "account", accountName)
 
     private val client = OkHttpClient.Builder().build()
 
@@ -73,6 +78,7 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            outgoingCounter.increment()
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -88,6 +94,7 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
+                completed(if (body.result) "success" else "fail")
             }
         } catch (e: Exception) {
             when (e) {
@@ -96,6 +103,7 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
+                    completed("timeout")
                 }
 
                 else -> {
@@ -104,12 +112,23 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
+                    completed("error")
                 }
             }
         } finally {
             parallelLimiter.release()
         }
     }
+
+    // Завершённые оплаты по исходу: rate(completed) — Processing speed, incoming − completed — заказы внутри магазина
+    private fun completed(outcome: String) =
+        meterRegistry.counter("shop.payments.completed", "account", accountName, "outcome", outcome).increment()
+
+    // для acc-5 min(3, 5 / 4.9) примерно 1.02 оплаты в секунду
+    override fun processingSpeed() =
+        minOf(rateLimitPerSec.toDouble(), parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis())
+
+    override fun averageProcessingTime(): Duration = requestAverageProcessingTime
 
     override fun price() = properties.price
 

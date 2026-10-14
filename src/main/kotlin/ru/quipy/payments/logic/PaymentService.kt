@@ -24,6 +24,11 @@ interface PaymentExternalSystemAdapter {
     fun price(): Int
 
     fun isEnabled(): Boolean
+
+    // Processing speed аккаунта: сколько оплат в секунду он может завершать
+    fun processingSpeed(): Double
+
+    fun averageProcessingTime(): Duration
 }
 
 /**
