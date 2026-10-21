@@ -858,6 +858,17 @@
               "legendFormat": "inside the shop",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "sum(shop_payments_inside)",
+              "legendFormat": "inside (gauge)",
+              "range": true,
+              "refId": "B"
             }
           ],
           "title": "Payments inside the shop",

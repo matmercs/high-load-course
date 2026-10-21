@@ -1,6 +1,7 @@
 package ru.quipy.payments.logic
 
 import io.micrometer.core.instrument.MeterRegistry
+import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -34,12 +35,13 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
 
-    // Запас на разброс времени ответа провайдера
-    private val deadlineMargin = Duration.ofSeconds(10)
+    // Запас на разброс времени ответа: дедлайн 3 с = 1 с ожидания очереди + 1 с ответа + 1 с запаса
+    private val deadlineMargin = Duration.ofSeconds(1)
 
+    // Вызов провайдера блокирующий: 110 запросов/с * 1 с ответа = 110 потоков
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        110,
+        110,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8_000),
@@ -66,20 +68,29 @@ class OrderPayer {
         return createdAt
     }
 
+    // Gauge: сколько заказов сейчас внутри магазина
+    // PostConstruct = вызови этот метод один раз, сразу после того как бин создан и в него внедрены все зависимости
+    // потому что meterRegistry уже должен быть внедрен
+    @PostConstruct
+    fun registerGauges() {
+        meterRegistry.gauge("shop.payments.inside", this) { it.inside() }
+    }
 
-     // Успеет ли новый заказ к дедлайну, если поставить его в очередь
-     // Ожидание = заказов внутри магазина (incoming − completed, наша метрика) / Processing speed
-     // + время обработки + запас. Успеет - null; не успеет - момент мс для Retry-After
+    // Внутри магазина = принятые (incoming) − завершённые (completed) в любом статусе
+    private fun inside() = meterRegistry.counter("shop.payments.incoming").count() -
+        meterRegistry.find("shop.payments.completed").counters().sumOf { it.count() }
+
+    // Back pressure: успеет ли заказ к дедлайну (внутри / скорость + время ответа + запас).
+    // Успеет - null, не успеет - момент (мс) для Retry-After
     fun retryAfterIfOverloaded(deadline: Long): Long? {
         val speed = paymentAccounts.sumOf { it.processingSpeed() }
-        val inside = meterRegistry.counter("shop.payments.incoming").count() -
-            meterRegistry.find("shop.payments.completed").counters().sumOf { it.count() }
+        val inside = inside()
         val processing = paymentAccounts.maxOf { it.averageProcessingTime() }
         val expectedFinish = now() + (inside / speed * 1000).toLong() + processing.toMillis() + deadlineMargin.toMillis()
         if (expectedFinish <= deadline) return null
 
         meterRegistry.counter("shop.payments.rejected").increment()
-        // Место в очереди освобождается примерно раз в 1 / speed секунд, раньше спрашивать бессмысленно
+        // Одно место освобождается примерно раз в 1 / speed секунд
         return now() + (1000 / speed).toLong()
     }
 }
