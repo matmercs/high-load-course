@@ -14,6 +14,9 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 
 // Advice: always treat time as a Duration
@@ -38,11 +41,21 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    // Не более rateLimitPerSec вызовов провайдера в любом отрезке длиной 1 с, иначе провайдер отвечает 429; лишние запросы ждут разрешения, а не отбрасываются
+    // Не более rateLimitPerSec вызовов провайдера в любом отрезке длиной 1 с + 10 мс запаса, лишние ждут разрешения.
+    // Провайдер считает свою секунду по своим часам и получает запрос с сетевой задержкой:
+    // без запаса 12-й вызов иногда попадал в его секунду (rate_limit_breached)
+    private val rateWindow = Duration.ofMillis(1010)
     private val rateLimiter = SlidingWindowRateLimiter(
         rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1),
+        window = rateWindow,
     )
+
+    // Ждущие разрешения получают его по порядку прихода (честная блокировка). Без неё tickBlocking()
+    // отдаёт освободившееся место случайному из ждущих, и на пиках «невезучие» заказы ждали дольше дедлайна
+    private val rateLimiterQueue = ReentrantLock(true)
+
+    // Время ответа провайдера: по максимуму видно худший случай, из него размер ведра на входе (OrderPayer)
+    private val providerTimer = meterRegistry.timer("shop.provider.duration", "account", accountName)
 
     // Не более parallelRequests вызовов провайдера одновременно, иначе провайдер отвечает
     // parallel_requests_limit_breached; fair = true слоты выдаются по очереди, ранние заказы не обгоняются поздними
@@ -71,7 +84,7 @@ class PaymentExternalSystemAdapterImpl(
         parallelLimiter.acquire()
         try {
             // Разрешение берём непосредственно перед отправкой, чтобы между ним и приходом запроса к провайдеру не было лишней работы, которая могла бы сдвинуть запросы в одно окно провайдера
-            rateLimiter.tickBlocking()
+            rateLimiterQueue.withLock { rateLimiter.tickBlocking() }
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -79,7 +92,9 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             outgoingCounter.increment()
+            val sentAt = now()
             client.newCall(request).execute().use { response ->
+                providerTimer.record(now() - sentAt, TimeUnit.MILLISECONDS)
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
@@ -124,11 +139,17 @@ class PaymentExternalSystemAdapterImpl(
     private fun completed(outcome: String) =
         meterRegistry.counter("shop.payments.completed", "account", accountName, "outcome", outcome).increment()
 
-    // для acc-5 min(3, 5 / 4.9) примерно 1.02 оплаты в секунду
+    // Скорость, которую выдерживаем гарантированно: rateLimitPerSec вызовов за окно 1.01 с плюс до 10 мс,
+    // пока tickBlocking() заметит свободное место (проверяет раз в 10 мс). Для acc-23: 11 / 1.02 с ≈ 10.8 в секунду
     override fun processingSpeed() =
-        minOf(rateLimitPerSec.toDouble(), parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis())
+        minOf(
+            rateLimitPerSec * 1000.0 / (rateWindow.toMillis() + 10),
+            parallelRequests * 1000.0 / requestAverageProcessingTime.toMillis()
+        )
 
     override fun averageProcessingTime(): Duration = requestAverageProcessingTime
+
+    override fun rateLimitPerSec() = rateLimitPerSec
 
     override fun price() = properties.price
 
