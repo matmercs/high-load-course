@@ -58,7 +58,7 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
-        // Back pressure: заказ не успеет к дедлайну — 429, тестирующая система подождёт до Retry-After и подаст заказ заново
+        // Rate limiter на входе (leaky bucket, см. OrderPayer): места нет — 429, тестирующая система подождёт до Retry-After и подаст заказ заново
         orderPayer.retryAfterIfOverloaded(deadline)?.let { retryAt ->
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", retryAt.toString()).build()
         }

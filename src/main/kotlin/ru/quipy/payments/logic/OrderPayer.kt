@@ -7,10 +7,10 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.LeakyBucketMeter
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -35,8 +35,9 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
 
-    // Запас на разброс времени ответа: дедлайн 3 с = 1 с ожидания очереди + 1 с ответа + 1 с запаса
-    private val deadlineMargin = Duration.ofSeconds(1)
+    // Rate limiter на входе — leaky bucket (meter): каждый принятый заказ доливает 1, ведро вытекает со скоростью,
+    // с которой мы гарантированно отправляем к провайдеру (для acc-23 ≈ 10.8 в секунду)
+    private val bucket by lazy { LeakyBucketMeter(paymentAccounts.sumOf { it.processingSpeed() }) }
 
     // Вызов провайдера блокирующий: 110 запросов/с * 1 с ответа = 110 потоков
     private val paymentExecutor = ThreadPoolExecutor(
@@ -80,17 +81,18 @@ class OrderPayer {
     private fun inside() = meterRegistry.counter("shop.payments.incoming").count() -
         meterRegistry.find("shop.payments.completed").counters().sumOf { it.count() }
 
-    // Back pressure: успеет ли заказ к дедлайну (внутри / скорость + время ответа + запас).
-    // Успеет - null, не успеет - момент (мс) для Retry-After
+    // Back pressure: место в ведре есть - null, нет - момент (мс) для Retry-After.
+    // Размер ведра - сколько заказов провайдер примет, пока заказ ещё может ждать (дедлайн − худший ответ),
+    // но не меньше одной секунды провайдера: тест 1 (2.5 с) - 11, тест 2 (13 с) - 121, тест 3 (26 с) - 264
     fun retryAfterIfOverloaded(deadline: Long): Long? {
-        val speed = paymentAccounts.sumOf { it.processingSpeed() }
-        val inside = inside()
-        val processing = paymentAccounts.maxOf { it.averageProcessingTime() }
-        val expectedFinish = now() + (inside / speed * 1000).toLong() + processing.toMillis() + deadlineMargin.toMillis()
-        if (expectedFinish <= deadline) return null
+        val rate = paymentAccounts.sumOf { it.rateLimitPerSec() }
+        // Ответ провайдера - от 0 до 2 средних (для acc-23 до 2 с)
+        val worstResponse = paymentAccounts.maxOf { it.averageProcessingTime() }.multipliedBy(2)
+        val canWaitSec = (deadline - now() - worstResponse.toMillis()) / 1000.0
+        val waitMs = bucket.tryAdd(rate * maxOf(1.0, canWaitSec)) ?: return null
 
         meterRegistry.counter("shop.payments.rejected").increment()
-        // Одно место освобождается примерно раз в 1 / speed секунд
-        return now() + (1000 / speed).toLong()
+        // Retry-After - момент, когда в ведре освободится место
+        return now() + waitMs
     }
 }

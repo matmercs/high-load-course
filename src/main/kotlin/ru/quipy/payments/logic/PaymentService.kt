@@ -29,6 +29,9 @@ interface PaymentExternalSystemAdapter {
     fun processingSpeed(): Double
 
     fun averageProcessingTime(): Duration
+
+    // Лимит аккаунта: сколько вызовов в секунду принимает провайдер
+    fun rateLimitPerSec(): Int
 }
 
 /**
