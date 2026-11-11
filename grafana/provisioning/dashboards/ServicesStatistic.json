@@ -759,6 +759,18 @@
               "legendFormat": "rejected (429)",
               "range": true,
               "refId": "D"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "sum(rate(shop_payments_retries_total[30s]))",
+              "instant": false,
+              "legendFormat": "retries (повторные вызовы)",
+              "range": true,
+              "refId": "E"
             }
           ],
           "title": "Payment flow: incoming / completed / outgoing (rps)",
