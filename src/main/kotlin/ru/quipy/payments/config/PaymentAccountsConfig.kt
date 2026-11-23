@@ -36,6 +36,9 @@ class PaymentAccountsConfig {
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
 
+    @Value("\${payment.acc-7.attempt-timeout-ms}")
+    private var acc7AttemptTimeoutMillis: Long = 0
+
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>, meterRegistry: MeterRegistry): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
@@ -53,13 +56,14 @@ class PaymentAccountsConfig {
             .filter { it.accountName in allowedAccounts }
             .map { it.copy(enabled = true) }
             .onEach(::println)
-            .map {
+            .map { account ->
                 PaymentExternalSystemAdapterImpl(
-                    it,
+                    account,
                     paymentService,
                     paymentProviderHostPort,
                     token,
                     meterRegistry,
+                    attemptTimeoutMillis = acc7AttemptTimeoutMillis.takeIf { it > 0 && account.accountName == "acc-7" },
                 )
             }
     }
