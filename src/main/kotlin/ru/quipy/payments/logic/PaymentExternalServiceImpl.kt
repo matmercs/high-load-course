@@ -3,6 +3,9 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -10,6 +13,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.*
@@ -26,6 +30,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val meterRegistry: MeterRegistry,
+    private val attemptTimeoutMillis: Long? = null,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -54,8 +59,19 @@ class PaymentExternalSystemAdapterImpl(
     // отдаёт освободившееся место случайному из ждущих, и на пиках «невезучие» заказы ждали дольше дедлайна
     private val rateLimiterQueue = ReentrantLock(true)
 
-    // Время ответа провайдера: по максимуму видно худший случай, из него размер ведра на входе (OrderPayer)
-    private val providerTimer = meterRegistry.timer("shop.provider.duration", "account", accountName)
+    // Длительность HTTP-попытки вместе с чтением тела. Таймауты видны отдельной серией.
+    private val providerTimers = listOf("response", "timeout", "io_error").associateWith { outcome ->
+        Timer.builder("shop.provider.duration")
+            .tags("account", accountName, "outcome", outcome)
+            .serviceLevelObjectives(
+                Duration.ofMillis(50), Duration.ofMillis(100), Duration.ofMillis(200),
+                Duration.ofMillis(300), Duration.ofMillis(500), Duration.ofMillis(750),
+                Duration.ofSeconds(1), Duration.ofMillis(1250), Duration.ofMillis(1500),
+                Duration.ofSeconds(2), Duration.ofMillis(2500), Duration.ofSeconds(3),
+                Duration.ofSeconds(4), Duration.ofSeconds(5), Duration.ofSeconds(6)
+            )
+            .register(meterRegistry)
+    }
 
     // Не более parallelRequests вызовов провайдера одновременно, иначе провайдер отвечает
     // parallel_requests_limit_breached; fair = true слоты выдаются по очереди, ранние заказы не обгоняются поздними
@@ -64,10 +80,24 @@ class PaymentExternalSystemAdapterImpl(
     // Исходящая нагрузка: сколько вызовов провайдера уходит (за каждый платим price)
     private val outgoingCounter = meterRegistry.counter("shop.payments.outgoing", "account", accountName)
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .eventListenerFactory {
+            object : EventListener() {
+                private val sample = Timer.start(meterRegistry)
 
-    // Худший ответ провайдера: время ответа — от 0 до 2 средних (для acc-8 до 1.4 с)
-    private val worstResponse = requestAverageProcessingTime.multipliedBy(2)
+                override fun callEnd(call: Call) {
+                    sample.stop(providerTimers.getValue("response"))
+                }
+
+                override fun callFailed(call: Call, ioe: IOException) {
+                    val outcome = if (ioe is InterruptedIOException) "timeout" else "io_error"
+                    sample.stop(providerTimers.getValue(outcome))
+                }
+            }
+        }
+        .build()
+
+    private val retryBudgetMillis = attemptTimeoutMillis ?: requestAverageProcessingTime.multipliedBy(2).toMillis()
 
     // Повторы всегда ограничиваем: каждая попытка стоит price. Не больше 3 попыток на оплату
     private val maxAttempts = 3
@@ -82,20 +112,18 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        // Провайдер отклоняет часть оплат (result = false), повторная попытка обычно проходит. Повторяем, пока
-        // попытки не кончились и до дедлайна не меньше худшего ответа — иначе попытка заведомо опоздает
+        // На повтор оставляем время минимум на одну попытку.
         var attempts = 1
         var outcome = pay(paymentId, amount, paymentStartedAt, deadline)
-        while (outcome in retriable && attempts < maxAttempts && deadline - now() >= worstResponse.toMillis()) {
+        while (outcome in retriable && attempts < maxAttempts && deadline - now() >= retryBudgetMillis) {
             attempts++
-            retryCounter.increment()
-            outcome = pay(paymentId, amount, paymentStartedAt, deadline)
+            outcome = pay(paymentId, amount, paymentStartedAt, deadline, retry = true)
         }
         completed(outcome)
     }
 
     // Одна попытка оплаты: свой transactionId, свои logSubmission / logProcessing. Возвращает исход попытки
-    private fun pay(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): String {
+    private fun pay(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, retry: Boolean = false): String {
         val transactionId = UUID.randomUUID()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
@@ -113,11 +141,11 @@ class PaymentExternalSystemAdapterImpl(
             // Разрешение берём непосредственно перед отправкой, чтобы между ним и приходом запроса к провайдеру не было лишней работы, которая могла бы сдвинуть запросы в одно окно провайдера
             rateLimiterQueue.withLock { rateLimiter.tickBlocking() }
 
-            // Deadline propagation: ждём ответа не дольше, чем ещё ждёт клиент (по умолчанию OkHttp ждёт 10 с)
+            // После лимитеров бюджет мог сократиться.
             val remaining = deadline - now()
-            if (remaining <= 0) {
+            if (remaining <= 0 || (retry && attemptTimeoutMillis != null && remaining < attemptTimeoutMillis)) {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before the call.")
+                    it.logProcessing(false, now(), transactionId, reason = "Not enough time before the deadline.")
                 }
                 return "timeout"
             }
@@ -127,11 +155,11 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            val callTimeoutMillis = minOf(remaining, attemptTimeoutMillis ?: remaining)
+            val call = client.newCall(request).apply { timeout().timeout(callTimeoutMillis, TimeUnit.MILLISECONDS) }
             outgoingCounter.increment()
-            val sentAt = now()
-            val call = client.newCall(request).apply { timeout().timeout(remaining, TimeUnit.MILLISECONDS) }
+            if (retry) retryCounter.increment()
             call.execute().use { response ->
-                providerTimer.record(now() - sentAt, TimeUnit.MILLISECONDS)
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
